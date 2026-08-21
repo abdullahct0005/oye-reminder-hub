@@ -3,9 +3,10 @@ import pandas as pd
 import re
 from urllib.parse import quote
 from datetime import datetime
+from io import BytesIO
 
 # ============================================================
-# APP CONFIG
+# CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -14,11 +15,8 @@ st.set_page_config(
     layout="wide"
 )
 
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-BATCH_SIZE = 10
+# Company number - excluded from reminders as a safety measure
+COMPANY_NUMBER = "9072587265"
 
 REQUIRED_COLUMNS = [
     "employee's name",
@@ -43,17 +41,38 @@ FIXED_COLUMNS = {
     "TYPE"
 }
 
+
 # ============================================================
-# FUNCTIONS
+# HELPER FUNCTIONS
 # ============================================================
+
+def normalize_column_name(column_name):
+    return str(column_name).strip().lower()
+
+
+def get_column(df, target_name):
+    """
+    Find a column without being affected by extra spaces
+    or upper/lower case differences.
+    """
+    target = normalize_column_name(target_name)
+
+    for column in df.columns:
+        if normalize_column_name(column) == target:
+            return column
+
+    return None
+
 
 def clean_phone(value):
     """
-    Convert mobile number into WhatsApp format.
+    Convert phone number into Indian WhatsApp format.
 
-    Returns:
-    - 91XXXXXXXXXX for valid Indian mobile numbers
-    - empty string for missing/invalid numbers
+    Examples:
+    9876543210 -> 919876543210
+    919876543210 -> 919876543210
+
+    Missing or invalid number -> ""
     """
 
     if pd.isna(value):
@@ -61,115 +80,121 @@ def clean_phone(value):
 
     value_str = str(value).strip()
 
-    if value_str.lower() in [
-        "",
-        "nan",
-        "none",
-        "null",
-        "n/a",
-        "na",
-        "0"
-    ]:
+    if value_str.lower() in ["", "nan", "none", "null"]:
         return ""
 
-    # Remove .0 from Excel numeric values
-    value_str = re.sub(r"\.0$", "", value_str)
-
-    # Keep digits only
     digits = re.sub(r"\D", "", value_str)
 
-    # Indian mobile number without country code
+    # Excel may convert numbers to something like 9876543210.0
+    if len(digits) > 10 and digits.endswith("0") and "." in value_str:
+        digits = digits[:-1]
+
+    # Standard Indian mobile number
     if len(digits) == 10:
         return "91" + digits
 
-    # Indian mobile number with country code
+    # Already contains country code
     if len(digits) == 12 and digits.startswith("91"):
         return digits
+
+    # Sometimes +91 is stored as 13 digits with 0?
+    if len(digits) == 11 and digits.startswith("0"):
+        return "91" + digits[1:]
 
     return ""
 
 
-def phone_display(phone):
+def is_valid_phone(phone):
     """
-    Display phone number in a readable format.
+    Validate Indian mobile number.
     """
 
     if not phone:
-        return "Number not updated in the system"
+        return False
 
-    if len(phone) == 12 and phone.startswith("91"):
-        return f"+91 {phone[2:]}"
+    if not phone.startswith("91"):
+        return False
 
-    return f"+{phone}"
+    return len(phone) == 12
+
+
+def is_company_number(phone):
+    """
+    Prevent accidental reminder to the company number.
+    """
+
+    return phone.endswith(COMPANY_NUMBER)
 
 
 def split_name_emp(value):
     """
-    Split:
-    Vishnu V C-5000580
-
-    Into:
-    Vishnu V C
-    5000580
+    Example:
+    Abdullah C T-50005805
+    ->
+    Abdullah C T
+    50005805
     """
 
-    text = str(value).strip()
-
-    if text.lower() in ["nan", "none", ""]:
+    if pd.isna(value):
         return "", ""
+
+    text = str(value).strip()
 
     match = re.search(r"-(\d{5,})$", text)
 
     if match:
-        name = text[:match.start()].strip()
+        employee_name = text[:match.start()].strip()
         employee_id = match.group(1)
 
-        return name, employee_id
+        return employee_name, employee_id
 
     return text, ""
 
 
 def course_columns(df):
     """
-    Identify course columns by removing fixed report columns.
+    Detect course columns by excluding known fixed columns.
     """
 
-    return [
-        column
-        for column in df.columns
-        if column not in FIXED_COLUMNS
-    ]
+    fixed_normalized = {
+        normalize_column_name(column)
+        for column in FIXED_COLUMNS
+    }
+
+    detected_courses = []
+
+    for column in df.columns:
+
+        column_normalized = normalize_column_name(column)
+
+        if column_normalized not in fixed_normalized:
+            detected_courses.append(column)
+
+    return detected_courses
 
 
 def normalize_status(value):
-    """
-    Normalize course status.
-    """
 
     if pd.isna(value):
         return "Not started"
 
-    text = str(value).strip()
+    status = str(value).strip()
 
-    if text == "" or text.lower() in ["nan", "none", "null"]:
+    if status == "":
         return "Not started"
 
-    return text
+    return status
 
 
 def status_class(value):
     """
-    Completed or Pending.
+    Completed = completed
+    Everything else = pending
     """
 
-    status = normalize_status(value).lower()
+    value_text = str(value).strip().lower()
 
-    if status in [
-        "completed",
-        "complete",
-        "100%",
-        "100"
-    ]:
+    if value_text == "completed":
         return "Completed"
 
     return "Pending"
@@ -190,123 +215,88 @@ def build_message(
     course = str(course).strip()
     status = str(status).strip()
 
-    if custom_template.strip():
+    # Custom template
+    if custom_template and custom_template.strip():
 
-        return (
-            custom_template
-            .replace("{name}", name)
-            .replace("{course}", course)
-            .replace("{status}", status)
-        )
+        message = custom_template.strip()
 
+        message = message.replace("{name}", name)
+        message = message.replace("{course}", course)
+        message = message.replace("{status}", status)
+
+        return message
+
+    # First reminder
     if reminder_level == "First Reminder":
 
         return (
-            f"Hi {name}, your *{course}* course on OYE "
-            f"is currently showing as *{status}*. "
+            f"Hi {name},\n\n"
+            f"Your *{course}* course on OYE is currently showing as "
+            f"*{status}*.\n\n"
             f"Please complete the course as soon as possible. "
             f"This is mandatory."
         )
 
+    # Second reminder
     if reminder_level == "Second Reminder":
 
         return (
-            f"Hi {name}, your *{course}* course is still "
-            f"showing as *{status}* on OYE. "
-            f"Please complete the mandatory course immediately."
+            f"Hi {name},\n\n"
+            f"This is a reminder regarding your *{course}* course on OYE.\n\n"
+            f"Current status: *{status}*\n\n"
+            f"The course is still pending. Please complete the mandatory "
+            f"course immediately."
         )
 
+    # Final reminder
     return (
-        f"URGENT REMINDER: Hi {name}, your *{course}* "
-        f"course is still pending on OYE. "
-        f"Please complete it immediately."
+        f"Hi {name},\n\n"
+        f"*URGENT REMINDER*\n\n"
+        f"Your *{course}* course is still pending on OYE.\n\n"
+        f"Current status: *{status}*\n\n"
+        f"Please complete the course immediately."
     )
 
 
 @st.cache_data(show_spinner=False)
-def load_report(file_bytes):
-    """
-    Load Excel from uploaded file bytes.
-    """
+def load_report(file_bytes, file_name):
 
-    return pd.read_excel(file_bytes)
-
-
-def initialize_campaign(campaign_key, total_count):
     """
-    Initialize or reset campaign state.
+    Read uploaded Excel safely.
+
+    BytesIO fixes the error:
+    Expected file path name or file-like object,
+    got <class 'bytes'>
     """
 
-    if (
-        "campaign_state" not in st.session_state
-        or st.session_state.campaign_state.get("key") != campaign_key
-    ):
+    file_object = BytesIO(file_bytes)
 
-        st.session_state.campaign_state = {
-            "key": campaign_key,
-            "batch_index": 0,
-            "sent": set(),
-            "skipped": set(),
-            "started": False,
-            "started_at": None,
-            "total_count": total_count
-        }
+    if str(file_name).lower().endswith(".xls"):
+        return pd.read_excel(
+            file_object,
+            engine="xlrd"
+        )
 
-
-def mark_batch_as_sent(state, batch_indices, valid_indices):
-    """
-    Mark all valid-number OECs in the current batch as sent.
-    Missing-number OECs are not marked as sent.
-    """
-
-    for index in valid_indices:
-        state["sent"].add(index)
-
-
-def whatsapp_url(phone, message):
-    """
-    Create WhatsApp Web URL.
-    """
-
-    return (
-        f"https://web.whatsapp.com/send"
-        f"?phone={phone}"
-        f"&text={quote(message)}"
+    return pd.read_excel(
+        file_object,
+        engine="openpyxl"
     )
 
 
-def whatsapp_button_html(phone, message):
-    """
-    Create an HTML button that always uses the same
-    browser window/tab name: whatsapp_chat.
+# ============================================================
+# SESSION STATE
+# ============================================================
 
-    This prevents a new WhatsApp tab from being created
-    for every OEC.
-    """
+if "campaign_state" not in st.session_state:
 
-    url = whatsapp_url(phone, message)
-
-    return f"""
-    <a
-        href="{url}"
-        target="whatsapp_chat"
-        style="
-            display: inline-block;
-            width: 100%;
-            box-sizing: border-box;
-            padding: 10px 16px;
-            background-color: #25D366;
-            color: white !important;
-            text-align: center;
-            text-decoration: none;
-            border-radius: 6px;
-            font-weight: 600;
-            font-size: 15px;
-        "
-    >
-        Open WhatsApp Chat
-    </a>
-    """
+    st.session_state.campaign_state = {
+        "key": None,
+        "batch": 0,
+        "started": False,
+        "started_at": None,
+        "sent_ids": set(),
+        "skipped_ids": set()
+    }
 
 
 # ============================================================
@@ -316,10 +306,8 @@ def whatsapp_button_html(phone, message):
 st.title("OYE Course Reminder Hub")
 
 st.caption(
-    "Shared trainer dashboard • "
-    "Upload OYE report • "
-    "Select trainer • "
-    "Send personalized WhatsApp reminders in batches"
+    "Shared trainer dashboard • Upload OYE report • "
+    "Select trainer • Send personalized WhatsApp reminders in batches of 10"
 )
 
 
@@ -337,8 +325,7 @@ with st.sidebar:
     )
 
     st.caption(
-        "Upload the newest report whenever OYE "
-        "completion status changes."
+        "Upload the newest report whenever OYE completion status changes."
     )
 
     st.divider()
@@ -346,45 +333,51 @@ with st.sidebar:
     st.header("How trainers use it")
 
     st.markdown(
-        "1. Upload latest report\n"
-        "2. Select your name\n"
-        "3. Select course\n"
-        "4. Start campaign\n"
-        "5. Send reminders in batches of 10\n"
-        "6. Mark each OEC as sent\n"
-        "7. Move to next 10"
-    )
-
-    st.divider()
-
-    st.header("Number Status")
-
-    st.caption(
-        "If the OYE report does not contain a valid "
-        "mobile number, the app shows:\n\n"
-        "**Number not updated in the system**"
+        """
+1. Upload latest report
+2. Select your name
+3. Select course
+4. Start campaign
+5. Send personalized reminders to 10 OECs
+6. Mark each OEC as sent
+7. Move to the next 10
+        """
     )
 
 
 # ============================================================
-# FILE VALIDATION
+# NO FILE
 # ============================================================
 
 if not uploaded:
 
     st.info(
-        "Upload the latest OYE Excel report from "
-        "the left panel to start."
+        "Upload the latest OYE Excel report from the left panel to start."
     )
 
     st.stop()
 
 
+# ============================================================
+# LOAD EXCEL
+# ============================================================
+
 try:
 
     file_bytes = uploaded.getvalue()
 
-    raw = load_report(file_bytes)
+    if not file_bytes:
+
+        st.error(
+            "The uploaded Excel file is empty. Please upload it again."
+        )
+
+        st.stop()
+
+    raw = load_report(
+        file_bytes,
+        uploaded.name
+    )
 
 except Exception as error:
 
@@ -392,21 +385,42 @@ except Exception as error:
         f"Could not read the Excel file: {error}"
     )
 
+    st.info(
+        "Please ensure the file is a valid .xlsx or .xls file."
+    )
+
     st.stop()
 
 
-# Remove spaces from column names
-raw.columns = [
-    str(column).strip()
-    for column in raw.columns
-]
+# ============================================================
+# FIND REQUIRED COLUMNS
+# ============================================================
 
+employee_column = get_column(
+    raw,
+    "employee's name"
+)
 
-missing_columns = [
-    column
-    for column in REQUIRED_COLUMNS
-    if column not in raw.columns
-]
+phone_column = get_column(
+    raw,
+    "Mob No"
+)
+
+trainer_column = get_column(
+    raw,
+    "Trainer Name"
+)
+
+missing_columns = []
+
+if employee_column is None:
+    missing_columns.append("employee's name")
+
+if phone_column is None:
+    missing_columns.append("Mob No")
+
+if trainer_column is None:
+    missing_columns.append("Trainer Name")
 
 
 if missing_columns:
@@ -416,11 +430,18 @@ if missing_columns:
         + ", ".join(missing_columns)
     )
 
+    st.write("Columns detected in your Excel file:")
+
+    st.write(list(raw.columns))
+
     st.stop()
 
 
-courses = course_columns(raw)
+# ============================================================
+# DETECT COURSES
+# ============================================================
 
+courses = course_columns(raw)
 
 if not courses:
 
@@ -431,11 +452,17 @@ if not courses:
     st.stop()
 
 
+# ============================================================
+# TRAINERS
+# ============================================================
+
 trainers = sorted(
-    raw["Trainer Name"]
+    raw[trainer_column]
     .dropna()
     .astype(str)
     .str.strip()
+    .replace("", pd.NA)
+    .dropna()
     .unique()
 )
 
@@ -454,7 +481,6 @@ if not trainers:
 # ============================================================
 
 col1, col2, col3 = st.columns(3)
-
 
 with col1:
 
@@ -488,112 +514,182 @@ custom_template = st.text_area(
     "Optional custom message template",
     placeholder=(
         "Example:\n"
-        "Hi {name}, your {course} course is currently "
-        "showing as {status}. Please complete it today."
+        "Hi {name}, your {course} course is {status}. "
+        "Please complete it today."
     ),
-    height=100
-)
-
-
-st.caption(
-    "Available message variables: "
-    "{name}, {course}, {status}"
+    height=110,
+    help=(
+        "You can use {name}, {course}, and {status}. "
+        "Leave empty to use the standard personalized message."
+    )
 )
 
 
 # ============================================================
-# PREPARE TRAINER DATA
+# FILTER TRAINER DATA
 # ============================================================
 
 data = raw[
-    raw["Trainer Name"]
+    raw[trainer_column]
     .astype(str)
     .str.strip()
     .eq(trainer)
 ].copy()
 
 
-data[[
-    "OEC Name",
-    "Employee ID"
-]] = data["employee's name"].apply(
+# Create name and employee ID
+data[["OEC Name", "Employee ID"]] = data[
+    employee_column
+].apply(
     lambda value: pd.Series(
         split_name_emp(value)
     )
 )
 
 
-data["WhatsApp Phone"] = (
-    data["Mob No"]
-    .apply(clean_phone)
-)
+# Clean phone numbers
+data["WhatsApp Phone"] = data[
+    phone_column
+].apply(clean_phone)
 
 
-data["Phone Status"] = data[
+# ============================================================
+# PHONE STATUS
+# ============================================================
+
+def phone_status(phone):
+
+    if not phone or not is_valid_phone(phone):
+
+        return "Number not updated in system"
+
+    if is_company_number(phone):
+
+        return "Company number"
+
+    return "Available"
+
+
+data["Number Status"] = data[
     "WhatsApp Phone"
-].apply(
-    lambda value: (
-        "Number Available"
-        if value
-        else "Number not updated in the system"
-    )
-)
+].apply(phone_status)
 
+
+# ============================================================
+# COURSE STATUS
+# ============================================================
 
 data["Course Status"] = data[
     course
-].apply(
-    normalize_status
-)
+].apply(normalize_status)
 
 
 data["Campaign Status"] = data[
     "Course Status"
-].apply(
-    status_class
-)
+].apply(status_class)
 
+
+# ============================================================
+# PERSONALIZED MESSAGE
+# ============================================================
 
 data["Reminder Message"] = data.apply(
     lambda row: build_message(
-        name=row["OEC Name"],
-        course=course,
-        status=row["Course Status"],
-        reminder_level=reminder_level,
-        custom_template=custom_template
+        row["OEC Name"],
+        course,
+        row["Course Status"],
+        reminder_level,
+        custom_template
     ),
     axis=1
 )
 
 
+# Unique campaign row ID
+data["Campaign ID"] = data.index.astype(str)
+
+
+# ============================================================
+# WHATSAPP LINK
+# ============================================================
+
+def create_whatsapp_link(row):
+
+    phone = row["WhatsApp Phone"]
+
+    if not is_valid_phone(phone):
+        return ""
+
+    if is_company_number(phone):
+        return ""
+
+    message = quote(
+        row["Reminder Message"]
+    )
+
+    return (
+        f"https://wa.me/{phone}?text={message}"
+    )
+
+
+data["WhatsApp Link"] = data.apply(
+    create_whatsapp_link,
+    axis=1
+)
+
+
+# ============================================================
+# PENDING AND COMPLETED
+# ============================================================
+
 pending = data[
     data["Campaign Status"] == "Pending"
-].reset_index(drop=True)
+].copy()
 
 
 completed = data[
     data["Campaign Status"] == "Completed"
+].copy()
+
+
+# Exclude company number from campaign
+company_number_rows = pending[
+    pending["Number Status"] == "Company number"
+].copy()
+
+
+pending_campaign = pending[
+    pending["Number Status"] != "Company number"
 ].reset_index(drop=True)
 
 
 # ============================================================
-# CAMPAIGN STATE
+# CAMPAIGN KEY
 # ============================================================
 
 campaign_key = (
     f"{uploaded.name}|"
+    f"{len(file_bytes)}|"
     f"{trainer}|"
     f"{course}|"
     f"{reminder_level}|"
-    f"{custom_template}|"
-    f"{len(pending)}"
+    f"{custom_template}"
 )
 
 
-initialize_campaign(
-    campaign_key,
-    len(pending)
-)
+if (
+    st.session_state.campaign_state["key"]
+    != campaign_key
+):
+
+    st.session_state.campaign_state = {
+        "key": campaign_key,
+        "batch": 0,
+        "started": False,
+        "started_at": None,
+        "sent_ids": set(),
+        "skipped_ids": set()
+    }
 
 
 state = st.session_state.campaign_state
@@ -603,44 +699,30 @@ state = st.session_state.campaign_state
 # METRICS
 # ============================================================
 
-total_oecs = len(data)
-pending_count = len(pending)
-completed_count = len(completed)
-
-missing_number_count = len(
-    pending[
-        pending["WhatsApp Phone"] == ""
-    ]
-)
-
+st.divider()
 
 metric1, metric2, metric3, metric4 = st.columns(4)
 
-
 metric1.metric(
     "My Total OECs",
-    total_oecs
+    len(data)
 )
-
 
 metric2.metric(
     "Pending",
-    pending_count
+    len(pending)
 )
-
 
 metric3.metric(
     "Completed",
-    completed_count
+    len(completed)
 )
-
 
 completion_percentage = (
-    completed_count / total_oecs * 100
-    if total_oecs
+    len(completed) / len(data) * 100
+    if len(data)
     else 0
 )
-
 
 metric4.metric(
     "Completion %",
@@ -648,36 +730,74 @@ metric4.metric(
 )
 
 
-if missing_number_count > 0:
+# ============================================================
+# NUMBER STATUS
+# ============================================================
 
-    st.warning(
-        f"⚠ {missing_number_count} pending OEC(s) have "
-        f"no valid mobile number in the OYE report."
-    )
+invalid_count = len(
+    pending_campaign[
+        pending_campaign["Number Status"]
+        == "Number not updated in system"
+    ]
+)
+
+available_count = len(
+    pending_campaign[
+        pending_campaign["Number Status"]
+        == "Available"
+    ]
+)
+
+
+status1, status2, status3 = st.columns(3)
+
+status1.metric(
+    "Available WhatsApp Numbers",
+    available_count
+)
+
+status2.metric(
+    "Number Not Updated",
+    invalid_count
+)
+
+status3.metric(
+    "Company Number Excluded",
+    len(company_number_rows)
+)
 
 
 # ============================================================
-# CHANNEL / TYPE SUMMARY
+# TYPE SUMMARY
 # ============================================================
 
-if "TYPE" in data.columns:
+type_column = get_column(
+    data,
+    "TYPE"
+)
 
-    with st.expander("View channel/type summary"):
+if type_column:
+
+    with st.expander(
+        "View channel/type summary"
+    ):
 
         summary = (
             data
-            .groupby("TYPE", dropna=False)
+            .groupby(type_column)
             .agg(
                 Total=("OEC Name", "size"),
                 Pending=(
                     "Campaign Status",
-                    lambda values:
-                        (values == "Pending").sum()
+                    lambda status: (
+                        status == "Pending"
+                    ).sum()
                 ),
                 Completed=(
                     "Campaign Status",
-                    lambda values:
-                        (values == "Completed").sum()
+                    lambda status: (
+                        status == "Completed"
+                    ).sum()
                 )
             )
             .reset_index()
@@ -690,40 +810,45 @@ if "TYPE" in data.columns:
         )
 
 
+# ============================================================
+# CAMPAIGN
+# ============================================================
+
 st.divider()
-
-
-# ============================================================
-# CAMPAIGN SECTION
-# ============================================================
 
 st.subheader(
     "My WhatsApp Reminder Campaign"
 )
 
 
-if pending_count == 0:
+if len(pending_campaign) == 0:
 
     st.success(
-        "🎉 No pending OECs for this course "
-        "in the latest report."
+        "No pending OECs are available for this course."
     )
-
 
 else:
 
-    # --------------------------------------------------------
-    # CAMPAIGN START
-    # --------------------------------------------------------
+    BATCH_SIZE = 10
 
-    top1, top2, top3, top4 = st.columns(
-        [1.3, 1, 1.5, 1]
-    )
+    total_batches = (
+        len(pending_campaign)
+        + BATCH_SIZE
+        - 1
+    ) // BATCH_SIZE
 
 
-    with top1:
+    # ----------------------------------------
+    # START CAMPAIGN
+    # ----------------------------------------
 
-        if not state["started"]:
+    if not state["started"]:
+
+        start_col1, start_col2 = st.columns(
+            [1, 3]
+        )
+
+        with start_col1:
 
             if st.button(
                 "Start Campaign",
@@ -734,212 +859,201 @@ else:
                 state["started"] = True
 
                 state["started_at"] = (
-                    datetime.now().strftime(
+                    datetime.now()
+                    .strftime(
                         "%d-%m-%Y %I:%M %p"
                     )
                 )
 
                 st.rerun()
 
-        else:
 
-            st.success("Campaign Active")
+        with start_col2:
+
+            st.info(
+                f"This campaign contains "
+                f"{len(pending_campaign)} pending OECs "
+                f"in {total_batches} batches of maximum 10."
+            )
 
 
-    with top2:
+    # ----------------------------------------
+    # ACTIVE CAMPAIGN
+    # ----------------------------------------
 
-        st.metric(
-            "Marked Sent",
-            len(state["sent"])
+    else:
+
+        current_batch = state["batch"]
+
+        start_index = (
+            current_batch * BATCH_SIZE
         )
 
+        end_index = min(
+            start_index + BATCH_SIZE,
+            len(pending_campaign)
+        )
 
-    with top3:
+        batch_data = pending_campaign.iloc[
+            start_index:end_index
+        ].copy()
+
+
+        # ----------------------------------------
+        # CAMPAIGN HEADER
+        # ----------------------------------------
+
+        head1, head2, head3, head4 = st.columns(4)
+
+        head1.success(
+            f"Batch {current_batch + 1} Active"
+        )
+
+        sent_count = len(
+            state["sent_ids"]
+        )
+
+        head2.metric(
+            "Marked Sent",
+            sent_count
+        )
+
+        head3.metric(
+            "This Batch",
+            f"{len(batch_data)} OECs"
+        )
 
         if state["started_at"]:
 
-            st.caption(
-                f"Started: "
+            head4.caption(
+                f"Started:\n\n"
                 f"{state['started_at']}"
             )
 
 
-    with top4:
+        # Progress bar
+        progress = (
+            len(state["sent_ids"])
+            + len(state["skipped_ids"])
+        ) / len(pending_campaign)
 
-        total_batches = (
-            (pending_count + BATCH_SIZE - 1)
-            // BATCH_SIZE
+        st.progress(
+            min(progress, 1.0)
         )
 
-        st.metric(
-            "Current Batch",
-            f"{state['batch_index'] + 1} "
-            f"of {total_batches}"
-        )
-
-
-    # --------------------------------------------------------
-    # PROGRESS
-    # --------------------------------------------------------
-
-    sent_count = len(state["sent"])
-
-    progress = (
-        sent_count / pending_count
-        if pending_count
-        else 0
-    )
-
-    st.progress(progress)
-
-    st.caption(
-        f"{sent_count} of {pending_count} "
-        f"pending OECs marked as sent"
-    )
-
-
-    # --------------------------------------------------------
-    # CURRENT BATCH
-    # --------------------------------------------------------
-
-    batch_start = (
-        state["batch_index"]
-        * BATCH_SIZE
-    )
-
-
-    batch_end = min(
-        batch_start + BATCH_SIZE,
-        pending_count
-    )
-
-
-    batch = pending.iloc[
-        batch_start:batch_end
-    ].copy()
-
-
-    st.markdown(
-        f"### Batch {state['batch_index'] + 1}: "
-        f"OEC {batch_start + 1}–{batch_end} "
-        f"of {pending_count}"
-    )
-
-
-    # --------------------------------------------------------
-    # COMPLETED CAMPAIGN
-    # --------------------------------------------------------
-
-    if (
-        sent_count >= pending_count
-        and pending_count > 0
-    ):
-
-        st.success(
-            "🎉 Campaign Completed!"
-        )
-
-        st.markdown(
-            f"""
-            ### Final Campaign Summary
-
-            **Total Pending OECs:** {pending_count}
-
-            **Marked Sent:** {sent_count}
-
-            **Missing / Invalid Numbers:** 
-            {missing_number_count}
-            """
+        st.caption(
+            f"Batch {current_batch + 1} of "
+            f"{total_batches} • "
+            f"OECs {start_index + 1} to {end_index} "
+            f"of {len(pending_campaign)}"
         )
 
 
-    # --------------------------------------------------------
-    # SHOW BATCH
-    # --------------------------------------------------------
+        # ----------------------------------------
+        # BATCH OF 10
+        # ----------------------------------------
 
-    else:
+        for row_position, row in batch_data.iterrows():
 
-        if not state["started"]:
+            campaign_id = row["Campaign ID"]
 
-            st.info(
-                "Click Start Campaign to begin sending "
-                "WhatsApp reminders."
+            oec_number = (
+                start_index
+                + row_position
+                + 1
+            )
+
+            already_sent = (
+                campaign_id
+                in state["sent_ids"]
+            )
+
+            already_skipped = (
+                campaign_id
+                in state["skipped_ids"]
             )
 
 
-        # ----------------------------------------------------
-        # EACH OEC CARD
-        # ----------------------------------------------------
-
-        for position, (
-            original_index,
-            row
-        ) in enumerate(
-            batch.iterrows(),
-            start=batch_start + 1
-        ):
-
-            is_sent = (
-                original_index
-                in state["sent"]
-            )
-
-            has_valid_number = (
-                bool(row["WhatsApp Phone"])
-            )
-
-
-            # OEC heading
-            if is_sent:
+            # Status heading
+            if already_sent:
 
                 st.success(
-                    f"✓ {position}. "
-                    f"{row['OEC Name']} "
-                    f"— Marked Sent"
+                    f"Sent: {oec_number}. "
+                    f"{row['OEC Name']}"
                 )
 
-            elif not has_valid_number:
+            elif already_skipped:
 
                 st.warning(
-                    f"⚠ {position}. "
-                    f"{row['OEC Name']} "
-                    f"— Number not updated in the system"
+                    f"Skipped: {oec_number}. "
+                    f"{row['OEC Name']}"
                 )
 
             else:
 
                 st.markdown(
-                    f"### {position}. "
+                    f"### {oec_number}. "
                     f"{row['OEC Name']}"
                 )
 
 
-            # Information
+            # Basic information
             info1, info2, info3, info4 = st.columns(4)
-
 
             with info1:
 
-                st.write(
-                    f"**Phone:** "
-                    f"{phone_display(row['WhatsApp Phone'])}"
-                )
+                if (
+                    row["Number Status"]
+                    == "Available"
+                ):
+
+                    st.write(
+                        f"**Phone:** "
+                        f"{row['WhatsApp Phone']}"
+                    )
+
+                else:
+
+                    st.error(
+                        "Number not updated in system"
+                    )
 
 
             with info2:
 
+                store_column = get_column(
+                    data,
+                    "Store"
+                )
+
+                store = (
+                    row.get(
+                        store_column,
+                        ""
+                    )
+                    if store_column
+                    else ""
+                )
+
                 st.write(
-                    f"**Store:** "
-                    f"{row.get('Store', '')}"
+                    f"**Store:** {store}"
                 )
 
 
             with info3:
 
-                st.write(
-                    f"**Type:** "
-                    f"{row.get('TYPE', '')}"
-                )
+                if type_column:
+
+                    st.write(
+                        f"**Type:** "
+                        f"{row.get(type_column, '')}"
+                    )
+
+                else:
+
+                    st.write(
+                        "**Type:** -"
+                    )
 
 
             with info4:
@@ -950,215 +1064,170 @@ else:
                 )
 
 
-            # ------------------------------------------------
-            # MISSING NUMBER
-            # ------------------------------------------------
-
-            if not has_valid_number:
-
-                st.error(
-                    "Number not updated in the system. "
-                    "Please update the mobile number in "
-                    "the OYE report/system before sending."
-                )
-
-                st.divider()
-
-                continue
-
-
-            # ------------------------------------------------
-            # MESSAGE
-            # ------------------------------------------------
-
-            message = st.text_area(
+            # Personalized message
+            st.text_area(
                 "Personalized Message",
-                value=row["Reminder Message"],
-                height=90,
+                value=row[
+                    "Reminder Message"
+                ],
+                height=120,
                 key=(
                     f"message_"
                     f"{campaign_key}_"
-                    f"{original_index}"
+                    f"{campaign_id}"
+                ),
+                disabled=(
+                    already_sent
+                    or already_skipped
                 )
             )
 
 
-            # ------------------------------------------------
-            # WHATSAPP + SENT BUTTON
-            # ------------------------------------------------
-
-            button_col1, button_col2 = st.columns(
-                [2, 1]
+            # Action buttons
+            button1, button2, button3 = st.columns(
+                [2, 1, 1]
             )
 
 
-            with button_col1:
+            with button1:
 
-                if state["started"]:
+                if (
+                    row["Number Status"]
+                    == "Available"
+                    and not already_sent
+                    and not already_skipped
+                ):
 
-                    # Same named WhatsApp window/tab
-                    st.markdown(
-                        whatsapp_button_html(
-                            row["WhatsApp Phone"],
-                            message
-                        ),
-                        unsafe_allow_html=True
-                    )
-
-                    st.caption(
-                        "The app attempts to reuse the same "
-                        "WhatsApp browser tab named "
-                        "'whatsapp_chat'."
-                    )
-
-                else:
-
-                    st.button(
-                        "Open WhatsApp Chat",
-                        disabled=True,
-                        key=(
-                            f"disabled_whatsapp_"
-                            f"{original_index}"
-                        ),
+                    st.link_button(
+                        f"Open WhatsApp for "
+                        f"{row['OEC Name']}",
+                        row["WhatsApp Link"],
+                        type="primary",
                         use_container_width=True
                     )
 
+                elif (
+                    row["Number Status"]
+                    == "Number not updated in system"
+                ):
 
-            with button_col2:
-
-                if is_sent:
-
-                    st.button(
-                        "✓ Sent",
-                        disabled=True,
-                        key=(
-                            f"sent_done_"
-                            f"{original_index}"
-                        ),
-                        use_container_width=True
+                    st.warning(
+                        "Cannot send until "
+                        "the mobile number is updated."
                     )
 
-                else:
 
-                    if st.button(
-                        "Mark Sent",
-                        disabled=not state["started"],
-                        key=(
-                            f"mark_sent_"
-                            f"{original_index}"
-                        ),
-                        use_container_width=True
-                    ):
+            with button2:
 
-                        state["sent"].add(
-                            original_index
-                        )
+                if st.button(
+                    "Mark Sent",
+                    key=(
+                        f"sent_"
+                        f"{campaign_key}_"
+                        f"{campaign_id}"
+                    ),
+                    disabled=(
+                        already_sent
+                        or already_skipped
+                        or row["Number Status"]
+                        != "Available"
+                    ),
+                    use_container_width=True
+                ):
 
-                        st.rerun()
+                    state[
+                        "sent_ids"
+                    ].add(
+                        campaign_id
+                    )
+
+                    st.rerun()
+
+
+            with button3:
+
+                if st.button(
+                    "Skip",
+                    key=(
+                        f"skip_"
+                        f"{campaign_key}_"
+                        f"{campaign_id}"
+                    ),
+                    disabled=(
+                        already_sent
+                        or already_skipped
+                    ),
+                    use_container_width=True
+                ):
+
+                    state[
+                        "skipped_ids"
+                    ].add(
+                        campaign_id
+                    )
+
+                    st.rerun()
 
 
             st.divider()
 
 
-        # ----------------------------------------------------
-        # BATCH ACTIONS
-        # ----------------------------------------------------
+        # ====================================================
+        # NEXT BATCH
+        # ====================================================
 
-        st.markdown(
-            "### Batch Actions"
+        st.subheader(
+            "Batch Controls"
+        )
+
+        control1, control2, control3 = st.columns(
+            3
         )
 
 
-        current_batch_indices = list(
-            range(batch_start, batch_end)
-        )
-
-
-        valid_batch_indices = [
-            index
-            for index in current_batch_indices
-            if pending.loc[
-                index,
-                "WhatsApp Phone"
-            ]
-        ]
-
-
-        sent_in_batch = sum(
-            1
-            for index in current_batch_indices
-            if index in state["sent"]
-        )
-
-
-        valid_in_batch = len(
-            valid_batch_indices
-        )
-
-
-        batch_action1, batch_action2, batch_action3, batch_action4 = st.columns(
-            4
-        )
-
-
-        with batch_action1:
+        with control1:
 
             if st.button(
-                "← Previous 10",
+                "Previous Batch",
                 disabled=(
-                    state["batch_index"] == 0
+                    current_batch == 0
                 ),
                 use_container_width=True
             ):
 
-                state["batch_index"] -= 1
+                state["batch"] -= 1
 
                 st.rerun()
 
 
-        with batch_action2:
+        with control2:
 
-            if st.button(
-                "Mark All Valid Numbers Sent",
-                disabled=not state["started"],
-                use_container_width=True
-            ):
+            if current_batch < total_batches - 1:
 
-                mark_batch_as_sent(
-                    state,
-                    current_batch_indices,
-                    valid_batch_indices
-                )
+                if st.button(
+                    "Complete This Batch & Next 10",
+                    type="primary",
+                    use_container_width=True
+                ):
 
-                st.rerun()
+                    state["batch"] += 1
 
+                    st.rerun()
 
-        with batch_action3:
+            else:
 
-            batch_has_unsent_valid = any(
-                index not in state["sent"]
-                for index in valid_batch_indices
-            )
+                if st.button(
+                    "Finish Campaign",
+                    type="primary",
+                    use_container_width=True
+                ):
 
-
-            next_disabled = (
-                batch_has_unsent_valid
-                or batch_end >= pending_count
-            )
+                    st.success(
+                        "Campaign completed."
+                    )
 
 
-            if st.button(
-                "Next 10 →",
-                disabled=next_disabled,
-                use_container_width=True
-            ):
-
-                state["batch_index"] += 1
-
-                st.rerun()
-
-
-        with batch_action4:
+        with control3:
 
             if st.button(
                 "Reset Campaign",
@@ -1167,75 +1236,93 @@ else:
 
                 st.session_state.campaign_state = {
                     "key": campaign_key,
-                    "batch_index": 0,
-                    "sent": set(),
-                    "skipped": set(),
+                    "batch": 0,
                     "started": False,
                     "started_at": None,
-                    "total_count": pending_count
+                    "sent_ids": set(),
+                    "skipped_ids": set()
                 }
 
                 st.rerun()
 
 
-        # ----------------------------------------------------
-        # BATCH STATUS
-        # ----------------------------------------------------
+# ============================================================
+# NUMBER NOT UPDATED LIST
+# ============================================================
 
-        st.caption(
-            f"Current batch: "
-            f"{sent_in_batch} of {valid_in_batch} "
-            f"valid-number OECs marked as sent."
-        )
+invalid_numbers = pending_campaign[
+    pending_campaign["Number Status"]
+    == "Number not updated in system"
+].copy()
 
 
-        if missing_number_count > 0:
+if len(invalid_numbers) > 0:
 
-            st.caption(
-                "OECs with missing numbers are not counted "
-                "as sent and remain highlighted for follow-up."
-            )
+    st.divider()
 
+    st.subheader(
+        "OECs With Number Not Updated"
+    )
+
+    invalid_columns = [
+        "OEC Name",
+        "Employee ID",
+        "Store",
+        "Course Status",
+        "Number Status"
+    ]
+
+    invalid_columns = [
+        column
+        for column in invalid_columns
+        if column in invalid_numbers.columns
+    ]
+
+    st.dataframe(
+        invalid_numbers[
+            invalid_columns
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================
+# FULL QUEUE
+# ============================================================
 
 st.divider()
-
-
-# ============================================================
-# PENDING QUEUE
-# ============================================================
 
 st.subheader(
     "My Pending Queue"
 )
 
 
-queue = pending.copy()
+queue = pending_campaign.copy()
 
 
-queue["Session Status"] = [
+def session_status(row):
 
-    (
-        "Marked Sent"
-        if index in state["sent"]
+    campaign_id = row["Campaign ID"]
 
-        else (
-            "Number not updated in the system"
-            if not queue.loc[
-                index,
-                "WhatsApp Phone"
-            ]
-            else "Pending Send"
-        )
-    )
+    if campaign_id in state["sent_ids"]:
+        return "Marked Sent"
 
-    for index in queue.index
-]
+    if campaign_id in state["skipped_ids"]:
+        return "Skipped"
+
+    if (
+        row["Number Status"]
+        != "Available"
+    ):
+        return "Number not updated in system"
+
+    return "Pending Send"
 
 
-queue["WhatsApp Phone"] = queue[
-    "WhatsApp Phone"
-].apply(
-    phone_display
+queue["Session Status"] = queue.apply(
+    session_status,
+    axis=1
 )
 
 
@@ -1243,16 +1330,15 @@ queue_columns = [
     "OEC Name",
     "Employee ID",
     "WhatsApp Phone",
-    "Phone Status",
+    "Number Status",
     "Store",
-    "TYPE",
     "Course Status",
     "Session Status",
     "Reminder Message"
 ]
 
 
-available_columns = [
+queue_columns = [
     column
     for column in queue_columns
     if column in queue.columns
@@ -1260,29 +1346,32 @@ available_columns = [
 
 
 st.dataframe(
-    queue[available_columns],
+    queue[queue_columns],
     use_container_width=True,
     height=450
 )
 
 
 # ============================================================
-# DOWNLOAD CAMPAIGN REPORT
+# DOWNLOAD CSV
 # ============================================================
 
 st.download_button(
-    "Download Full Campaign Report (CSV)",
+    "Download My Campaign Queue (CSV)",
     queue[
-        available_columns
-    ].to_csv(
+        queue_columns
+    ]
+    .to_csv(
         index=False
-    ).encode(
+    )
+    .encode(
         "utf-8-sig"
     ),
     file_name=(
-        f"OYE_Campaign_"
+        f"OYE_"
         f"{trainer.replace(' ', '_')}_"
-        f"{course.replace(' ', '_')}.csv"
+        f"{str(course).replace(' ', '_')}"
+        f".csv"
     ),
     mime="text/csv"
 )
@@ -1294,17 +1383,8 @@ st.download_button(
 
 st.divider()
 
-
 st.caption(
-    "OYE Course Reminder Hub • "
-    "Batch-based personalized WhatsApp reminder system • "
-    "Current campaign status is stored in the active browser session."
-)
-
-
-st.caption(
-    "For permanent shared history, trainer logins, "
-    "and campaign tracking across devices, "
-    "the next version can be connected to "
-    "Supabase or Firebase."
+    "Each WhatsApp message is personalized with the OEC's name. "
+    "This app prepares reminders and opens WhatsApp; the trainer "
+    "remains responsible for reviewing and sending each message."
 )
