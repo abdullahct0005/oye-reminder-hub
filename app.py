@@ -1166,20 +1166,25 @@ for index, row in batch.iterrows():
     )
 
 
+# Keep the visible queue selector and queue_index in sync.
+# The stable widget key lets the Next/Previous buttons move directly
+# to another person without requiring the user to scroll back up.
+queue_selector_key = (
+    f"queue_selector_{st.session_state.batch_number}"
+)
+
+if queue_selector_key not in st.session_state:
+    st.session_state[queue_selector_key] = queue_options[
+        st.session_state.queue_index
+    ]
+
 selected_label = st.radio(
     "Select the person whose WhatsApp draft you want to prepare",
     queue_options,
-    index=st.session_state.queue_index,
-    key=(
-        f"queue_selector_"
-        f"{st.session_state.batch_number}"
-    ),
+    key=queue_selector_key,
 )
 
-selected_index = queue_options.index(
-    selected_label
-)
-
+selected_index = queue_options.index(selected_label)
 st.session_state.queue_index = selected_index
 
 current = batch.iloc[
@@ -1330,7 +1335,7 @@ else:
     )
 
 
-action1, action2, action3 = st.columns(3)
+action1, action2, action3, action4 = st.columns(4)
 
 with action1:
     if st.button(
@@ -1362,6 +1367,31 @@ with action2:
         )
 
 with action3:
+    def go_to_previous_person():
+        previous_index = max(
+            st.session_state.queue_index - 1,
+            0,
+        )
+        st.session_state.queue_index = previous_index
+        st.session_state[queue_selector_key] = queue_options[previous_index]
+
+    if st.button(
+        "← Previous",
+        disabled=(selected_index <= 0),
+        use_container_width=True,
+        on_click=go_to_previous_person,
+    ):
+        pass
+
+with action4:
+    def go_to_next_person():
+        next_index = min(
+            st.session_state.queue_index + 1,
+            len(batch) - 1,
+        )
+        st.session_state.queue_index = next_index
+        st.session_state[queue_selector_key] = queue_options[next_index]
+
     if st.button(
         "Next Person →",
         disabled=(
@@ -1369,13 +1399,9 @@ with action3:
             >= len(batch) - 1
         ),
         use_container_width=True,
+        on_click=go_to_next_person,
     ):
-        st.session_state.queue_index = min(
-            selected_index + 1,
-            len(batch) - 1,
-        )
-
-        st.rerun()
+        pass
 
 
 # ============================================================
