@@ -4,16 +4,10 @@ import re
 from io import BytesIO
 from urllib.parse import quote
 from datetime import datetime
-import streamlit.components.v1 as components
 
 # ============================================================
-# OYE COURSE REMINDER HUB
-# One reusable WhatsApp tab + batches of 10
-# IMPORTANT:
-# Regular WhatsApp Web cannot hold 10 different chat drafts
-# simultaneously in one tab. One tab can display only one chat.
-# This app keeps 10 OECs in the current batch and reuses ONE
-# WhatsApp tab for whichever OEC you choose.
+# OYE COURSE REMINDER HUB - FINAL VERSION
+# Batches of 10 + personalized messages + reusable WhatsApp tab
 # ============================================================
 
 st.set_page_config(
@@ -59,10 +53,7 @@ def clean_text(value):
 
 
 def clean_phone(value):
-    """
-    Returns:
-        phone_with_country_code, is_valid
-    """
+    """Return (phone_with_country_code, is_valid)."""
     if pd.isna(value):
         return "", False
 
@@ -83,13 +74,9 @@ def split_name_emp(value):
     """
     Example:
     Abdullah C T-5005805
-
-    Returns:
-    Abdullah C T
-    5005805
+    -> Abdullah C T, 5005805
     """
     value = clean_text(value)
-
     match = re.search(r"-(\d{5,})$", value)
 
     if match:
@@ -100,9 +87,9 @@ def split_name_emp(value):
 
 def get_course_columns(df):
     """
-    Any column not in the fixed OYE columns is treated as a course.
-    Therefore newly added courses are detected automatically when
-    the new Excel file is uploaded.
+    Automatically treats every non-fixed OYE column as a course.
+    Therefore, new course columns are detected after uploading
+    a new OYE Excel report.
     """
     return [
         column
@@ -117,30 +104,18 @@ def get_course_status(value):
 
 
 def get_campaign_status(value):
-    return (
-        "Completed"
-        if clean_text(value).lower() == "completed"
-        else "Pending"
-    )
+    if clean_text(value).lower() == "completed":
+        return "Completed"
+    return "Pending"
 
 
-def build_message(
-    name,
-    course,
-    status,
-    reminder_level,
-    custom_template=""
-):
+def build_message(name, course, status, reminder_level, custom_template=""):
     """
-    Custom placeholders:
+    Supported custom placeholders:
     {name}
     {course}
     {status}
-
-    If a custom template is used, placeholders are replaced
-    automatically for every OEC and every selected course.
     """
-
     name = clean_text(name)
     course = clean_text(course)
     status = clean_text(status)
@@ -175,8 +150,7 @@ def build_message(
         f"URGENT REMINDER:\n\n"
         f"Your *{course}* course is still pending on OYE "
         f"(Status: *{status}*).\n\n"
-        f"Please complete it immediately. "
-        f"This is mandatory."
+        f"Please complete it immediately. This is mandatory."
     )
 
 
@@ -188,65 +162,47 @@ def make_whatsapp_web_url(phone, message):
     )
 
 
-def make_mobile_whatsapp_url(phone, message):
-    return (
-        "https://api.whatsapp.com/send"
-        f"?phone={phone}"
-        f"&text={quote(message)}"
-    )
-
-
-def open_whatsapp_in_reusable_tab(url, label, key):
+def render_whatsapp_link(url, label, key):
     """
-    Opens/reuses ONE browser window/tab with the fixed name
-    oye_whatsapp_window.
+    IMPORTANT:
+    This is a normal HTML link, not window.open().
 
-    The important part is window.open(url, 'oye_whatsapp_window')
-    instead of target=_blank.
+    Every OEC uses the SAME target name:
+    oye_whatsapp_window
 
-    Every OEC button calls the same named window.
+    Browser behavior:
+    - First click creates/opens the WhatsApp tab/window.
+    - Later clicks with the same target name reuse that same tab/window.
+
+    This is intended to prevent one new WhatsApp tab per OEC.
     """
+    safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", str(key))[:120]
+
     html = f"""
-    <button
-        id="btn-{key}"
+    <a
+        id="wa-{safe_key}"
+        href="{url}"
+        target="oye_whatsapp_window"
         style="
+            display:block;
             width:100%;
+            box-sizing:border-box;
+            text-align:center;
             padding:12px 16px;
             border-radius:8px;
-            border:1px solid #25D366;
-            background:#25D366;
-            color:white;
+            text-decoration:none;
             font-weight:700;
-            font-size:15px;
-            cursor:pointer;
+            color:white;
+            background-color:#25D366;
+            border:1px solid #25D366;
+            margin:8px 0;
         "
     >
         {label}
-    </button>
-
-    <script>
-    const btn = document.getElementById("btn-{key}");
-    btn.addEventListener("click", function() {{
-        const url = {url!r};
-        const wa = window.open(
-            url,
-            "oye_whatsapp_window",
-            "noopener=no"
-        );
-
-        if (wa) {{
-            wa.focus();
-        }} else {{
-            window.location.href = url;
-        }}
-    }});
-    </script>
+    </a>
     """
 
-    components.html(
-        html,
-        height=55
-    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -254,7 +210,7 @@ def load_report(file_bytes):
     return pd.read_excel(BytesIO(file_bytes))
 
 
-def reset_campaign(campaign_key):
+def reset_campaign(campaign_key=None):
     st.session_state.campaign_state = {
         "campaign_key": campaign_key,
         "batch_number": 0,
@@ -269,7 +225,7 @@ def reset_campaign(campaign_key):
 # ============================================================
 
 if "campaign_state" not in st.session_state:
-    reset_campaign(None)
+    reset_campaign()
 
 
 # ============================================================
@@ -285,32 +241,31 @@ with st.sidebar:
     )
 
     st.caption(
-        "Upload the newest OYE report whenever completion "
-        "status changes."
+        "Upload the latest report whenever OYE completion status changes."
     )
 
     st.divider()
 
-    st.header("How trainers use it")
+    st.header("How to use")
 
     st.markdown(
         """
-        1. Upload latest report  
+        1. Upload latest OYE report  
         2. Select your trainer name  
-        3. Select course  
+        3. Select the course  
         4. Start campaign  
-        5. View 10 OECs at a time  
-        6. Open an OEC's personalized WhatsApp draft  
-        7. Manually click Send in WhatsApp Web  
-        8. Return here and mark the OEC as sent  
-        9. Move to the next OEC or next batch  
+        5. Work in batches of 10  
+        6. Open a personalized WhatsApp draft  
+        7. Manually click Send in WhatsApp  
+        8. Mark the OEC as sent  
+        9. Move to the next OEC/batch  
         """
     )
 
     st.divider()
 
     st.caption(
-        "One reusable WhatsApp Web tab is used for all OECs."
+        "The same named WhatsApp tab/window is reused for every OEC."
     )
 
 
@@ -327,30 +282,22 @@ st.caption(
 
 
 # ============================================================
-# NO FILE
+# UPLOAD / LOAD REPORT
 # ============================================================
 
 if uploaded_file is None:
     st.info("Upload the latest OYE Excel report to start.")
     st.stop()
 
-
-# ============================================================
-# LOAD EXCEL
-# ============================================================
-
 try:
     raw = load_report(uploaded_file.getvalue())
-
 except Exception as error:
-    st.error(
-        f"Could not read the Excel file: {error}"
-    )
+    st.error(f"Could not read the Excel file: {error}")
     st.stop()
 
 
 # ============================================================
-# VALIDATE COLUMNS
+# VALIDATE REPORT
 # ============================================================
 
 missing_columns = [
@@ -368,7 +315,7 @@ if missing_columns:
 
 
 # ============================================================
-# TRAINERS AND COURSES
+# TRAINERS / COURSES
 # ============================================================
 
 courses = get_course_columns(raw)
@@ -378,25 +325,21 @@ trainers = sorted(
     .dropna()
     .astype(str)
     .str.strip()
-    .loc[lambda s: s != ""]
+    .loc[lambda series: series != ""]
     .unique()
 )
 
 if not courses:
-    st.error(
-        "No course columns were detected in this Excel file."
-    )
+    st.error("No course columns were detected in this Excel file.")
     st.stop()
 
 if not trainers:
-    st.error(
-        "No trainer names were found."
-    )
+    st.error("No trainer names were found.")
     st.stop()
 
 
 # ============================================================
-# SETTINGS
+# CAMPAIGN SETTINGS
 # ============================================================
 
 col1, col2, col3 = st.columns(3)
@@ -423,11 +366,6 @@ with col3:
         ]
     )
 
-
-# ============================================================
-# CUSTOM MESSAGE
-# ============================================================
-
 custom_template = st.text_area(
     "Optional Custom Message Template",
     placeholder=(
@@ -440,14 +378,13 @@ custom_template = st.text_area(
 )
 
 st.caption(
-    "Placeholders are automatic: {name}, {course}, {status}. "
-    "You do not need to type the OEC name or course manually "
-    "for every message."
+    "Use {name}, {course}, and {status}. "
+    "They are filled automatically for every OEC."
 )
 
 
 # ============================================================
-# FILTER TRAINER DATA
+# FILTER SELECTED TRAINER
 # ============================================================
 
 data = raw[
@@ -458,14 +395,12 @@ data = raw[
 ].copy()
 
 if data.empty:
-    st.warning(
-        "No OECs were found for the selected trainer."
-    )
+    st.warning("No OECs were found for the selected trainer.")
     st.stop()
 
 
 # ============================================================
-# NAME AND EMPLOYEE ID
+# NAME / EMPLOYEE ID
 # ============================================================
 
 name_employee = data["employee's name"].apply(
@@ -509,23 +444,14 @@ data["Number Status"] = data["Valid Number"].apply(
 
 
 # ============================================================
-# COURSE STATUS
+# COURSE STATUS / PERSONALIZED MESSAGE
 # ============================================================
 
-data["Course Status"] = data[course].apply(
-    get_course_status
-)
+data["Course Status"] = data[course].apply(get_course_status)
 
-data["Campaign Status"] = data[
-    "Course Status"
-].apply(
+data["Campaign Status"] = data["Course Status"].apply(
     get_campaign_status
 )
-
-
-# ============================================================
-# PERSONALIZED MESSAGE
-# ============================================================
 
 data["Reminder Message"] = data.apply(
     lambda row: build_message(
@@ -538,11 +464,6 @@ data["Reminder Message"] = data.apply(
     axis=1
 )
 
-
-# ============================================================
-# WHATSAPP LINKS
-# ============================================================
-
 data["WhatsApp Web Link"] = data.apply(
     lambda row:
     make_whatsapp_web_url(
@@ -553,22 +474,6 @@ data["WhatsApp Web Link"] = data.apply(
     else "",
     axis=1
 )
-
-data["WhatsApp Mobile Link"] = data.apply(
-    lambda row:
-    make_mobile_whatsapp_url(
-        row["WhatsApp Phone"],
-        row["Reminder Message"]
-    )
-    if row["Valid Number"]
-    else "",
-    axis=1
-)
-
-
-# ============================================================
-# UNIQUE ID
-# ============================================================
 
 data["Unique ID"] = data.apply(
     lambda row:
@@ -584,25 +489,20 @@ data["Unique ID"] = data.apply(
 # ============================================================
 
 pending = (
-    data[
-        data["Campaign Status"] == "Pending"
-    ]
+    data[data["Campaign Status"] == "Pending"]
     .copy()
     .reset_index(drop=True)
 )
 
 completed = (
-    data[
-        data["Campaign Status"] == "Completed"
-    ]
+    data[data["Campaign Status"] == "Completed"]
     .copy()
     .reset_index(drop=True)
 )
 
 
 # ============================================================
-# CAMPAIGN KEY
-# Custom template is included so changing it resets the campaign
+# CAMPAIGN SESSION KEY
 # ============================================================
 
 campaign_key = (
@@ -628,22 +528,24 @@ if state["campaign_key"] != campaign_key:
 
 st.divider()
 
-s1, s2, s3, s4 = st.columns(4)
+m1, m2, m3, m4 = st.columns(4)
 
-s1.metric("My Total OECs", len(data))
-s2.metric("Pending", len(pending))
-s3.metric("Completed", len(completed))
-s4.metric(
+m1.metric("My Total OECs", len(data))
+m2.metric("Pending", len(pending))
+m3.metric("Completed", len(completed))
+
+completion_percentage = (
+    len(completed) / len(data) * 100
+    if len(data) else 0
+)
+
+m4.metric(
     "Completion %",
-    f"{(len(completed) / len(data) * 100):.1f}%"
-    if len(data)
-    else "0.0%"
+    f"{completion_percentage:.1f}%"
 )
 
 if pending.empty:
-    st.success(
-        "All OECs in the selected trainer/course are completed."
-    )
+    st.success("All OECs for this course are completed.")
     st.stop()
 
 
@@ -663,45 +565,32 @@ with top1:
             use_container_width=True
         ):
             state["started"] = True
-            state["started_at"] = (
-                datetime.now()
-                .strftime("%d-%m-%Y %I:%M %p")
+            state["started_at"] = datetime.now().strftime(
+                "%d-%m-%Y %I:%M %p"
             )
             st.rerun()
     else:
         st.success("Campaign Active")
 
 with top2:
-    st.metric(
-        "Marked Sent",
-        len(state["sent_ids"])
-    )
+    st.metric("Marked Sent", len(state["sent_ids"]))
 
 with top3:
-    remaining = max(
-        0,
-        len(pending) - len(state["sent_ids"])
-    )
-
     st.metric(
         "Remaining",
-        remaining
+        max(0, len(pending) - len(state["sent_ids"]))
     )
 
     if state["started_at"]:
-        st.caption(
-            f"Started: {state['started_at']}"
-        )
+        st.caption(f"Started: {state['started_at']}")
 
 if not state["started"]:
-    st.info(
-        "Click Start Campaign to begin the batch."
-    )
+    st.info("Click Start Campaign to begin.")
     st.stop()
 
 
 # ============================================================
-# BATCH CALCULATION
+# BATCH OF 10
 # ============================================================
 
 total_batches = (
@@ -721,9 +610,7 @@ end_index = min(
     len(pending)
 )
 
-batch = pending.iloc[
-    start_index:end_index
-].copy()
+batch = pending.iloc[start_index:end_index].copy()
 
 
 # ============================================================
@@ -762,10 +649,7 @@ with nav2:
 with nav3:
     if st.button(
         "Next Batch →",
-        disabled=(
-            current_batch_number
-            >= total_batches - 1
-        ),
+        disabled=(current_batch_number >= total_batches - 1),
         use_container_width=True
     ):
         state["batch_number"] += 1
@@ -778,36 +662,28 @@ with nav3:
 
 st.divider()
 
-st.subheader(
-    f"Current Batch – {len(batch)} OECs"
-)
+st.subheader(f"Current Batch – {len(batch)} OECs")
 
 st.info(
-    "This batch contains 10 personalized messages. "
-    "Click any OEC's WhatsApp button and the SAME reusable "
-    "WhatsApp Web tab will navigate to that OEC's draft. "
-    "Regular WhatsApp Web can show only one active chat/draft "
-    "inside one tab, so the 10 chats are handled sequentially. "
-    "You manually click Send in WhatsApp."
+    "Each OEC has a personalized draft. All valid WhatsApp links use "
+    "the same browser target: oye_whatsapp_window. The first click opens "
+    "WhatsApp; later clicks should reuse that same WhatsApp tab/window."
 )
 
 
 # ============================================================
-# SHOW OECs
+# OEC CARDS
 # ============================================================
 
 for position, (_, row) in enumerate(
     batch.iterrows(),
     start=start_index + 1
 ):
-
     oec_id = row["Unique ID"]
 
     with st.container(border=True):
 
-        left, middle, right = st.columns(
-            [1.3, 2, 1.3]
-        )
+        left, middle, right = st.columns([1.3, 2, 1.3])
 
         with left:
             st.markdown(
@@ -824,13 +700,9 @@ for position, (_, row) in enumerate(
             )
 
         with middle:
+            st.write(f"**Store:** {row.get('Store', '')}")
             st.write(
-                f"**Store:** {row.get('Store', '')}"
-            )
-
-            st.write(
-                f"**Course Status:** "
-                f"{row['Course Status']}"
+                f"**Course Status:** {row['Course Status']}"
             )
 
             if "TYPE" in row.index:
@@ -841,27 +713,18 @@ for position, (_, row) in enumerate(
         with right:
             if row["Valid Number"]:
                 st.success("Number Updated")
-
-                st.caption(
-                    row["WhatsApp Phone"]
-                )
+                st.caption(row["WhatsApp Phone"])
             else:
-                st.error(
-                    "Number Not Updated in System"
-                )
+                st.error("Number Not Updated in System")
 
-                original_number = clean_text(
-                    row["Mob No"]
-                )
+                original_number = clean_text(row["Mob No"])
 
                 if original_number:
                     st.caption(
                         f"Current value: {original_number}"
                     )
 
-        with st.expander(
-            "View personalized message"
-        ):
+        with st.expander("View personalized message"):
             st.text_area(
                 "Message",
                 value=row["Reminder Message"],
@@ -871,26 +734,22 @@ for position, (_, row) in enumerate(
             )
 
         if row["Valid Number"]:
-
-            open_whatsapp_in_reusable_tab(
+            render_whatsapp_link(
                 row["WhatsApp Web Link"],
                 "Open / Reuse WhatsApp Web Draft",
-                re.sub(
-                    r"[^A-Za-z0-9_]",
-                    "_",
-                    f"{campaign_key}_{oec_id}"
-                )[:100]
+                f"{campaign_key}_{oec_id}"
             )
 
             st.caption(
-                "This uses the same named browser window "
-                "`oye_whatsapp_window` for every OEC."
+                "Click the first OEC to open WhatsApp. For the next OEC, "
+                "return here and click their button; the same named WhatsApp "
+                "tab/window is intended to be reused."
             )
 
         else:
             st.warning(
-                "A valid mobile number is not available, "
-                "so this OEC cannot be opened in WhatsApp."
+                "A valid mobile number is not available, so this OEC "
+                "cannot be opened in WhatsApp."
             )
 
         sent_col, status_col = st.columns(2)
@@ -917,14 +776,12 @@ for position, (_, row) in enumerate(
 
 
 # ============================================================
-# BOTTOM NAVIGATION
+# BOTTOM BATCH NAVIGATION
 # ============================================================
 
 st.divider()
 
-bottom1, bottom2, bottom3 = st.columns(
-    [1, 2, 1]
-)
+bottom1, bottom2, bottom3 = st.columns([1, 2, 1])
 
 with bottom1:
     if st.button(
@@ -943,8 +800,7 @@ with bottom2:
             padding-top:10px;
             font-weight:700;
         ">
-            Batch {current_batch_number + 1}
-            of {total_batches}
+            Batch {current_batch_number + 1} of {total_batches}
         </div>
         """,
         unsafe_allow_html=True
@@ -953,10 +809,7 @@ with bottom2:
 with bottom3:
     if st.button(
         "Next Batch → ",
-        disabled=(
-            current_batch_number
-            >= total_batches - 1
-        ),
+        disabled=(current_batch_number >= total_batches - 1),
         use_container_width=True
     ):
         state["batch_number"] += 1
@@ -978,7 +831,7 @@ if st.button(
 
 
 # ============================================================
-# PENDING QUEUE
+# QUEUE
 # ============================================================
 
 st.divider()
@@ -987,9 +840,7 @@ st.subheader("My Pending Queue")
 
 queue = pending.copy()
 
-queue["Session Status"] = queue[
-    "Unique ID"
-].apply(
+queue["Session Status"] = queue["Unique ID"].apply(
     lambda value:
     "Marked Sent"
     if value in state["sent_ids"]
@@ -1041,7 +892,7 @@ st.divider()
 
 st.caption(
     "OYE Reminder Hub • Messages are not sent automatically. "
-    "Each OEC receives a personalized draft with the selected "
-    "course and their name. The trainer manually clicks Send "
-    "in WhatsApp Web."
+    "Each OEC receives a personalized draft containing their name, "
+    "the selected course and their course status. The trainer manually "
+    "clicks Send in WhatsApp."
 )
